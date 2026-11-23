@@ -1,4 +1,4 @@
-import React, { memo } from 'react';
+import React, { memo, useState, useCallback } from 'react';
 import ReactDOM from 'react-dom/client';
 import { ReactFlow, Background, Controls, Handle, Position } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
@@ -28,9 +28,53 @@ const nodeStyle = {
 
 const containerStyle = { width: '100vw', height: '100vh' };
 
+const POPOVER_WIDTH = 260;
+
+const popoverStyle = {
+  position: 'fixed',
+  width: POPOVER_WIDTH,
+  maxHeight: '60vh',
+  overflowY: 'auto',
+  background: '#fff',
+  color: '#222',
+  border: '1px solid #ccc',
+  borderRadius: 8,
+  boxShadow: '0 6px 20px rgba(0,0,0,0.18)',
+  padding: 12,
+  fontSize: 12,
+  zIndex: 10,
+};
+
+const popoverTitleStyle = { fontWeight: 700, marginBottom: 8, whiteSpace: 'pre-line' };
+const sectionTitleStyle = { fontWeight: 600, color: '#666', margin: '8px 0 4px' };
+const listStyle = { margin: 0, paddingLeft: 18 };
+const emptyStyle = { color: '#999', fontStyle: 'italic' };
+
+// Hover de aristas + cursor de nodos resueltos con CSS: cero estado, cero re-renders
+const flowCss = `
+  .react-flow__node { cursor: pointer; }
+  .react-flow__edge .react-flow__edge-path {
+    stroke: #b1b1b7;
+    stroke-width: 1.5;
+    transition: stroke 0.15s, stroke-width 0.15s, filter 0.15s;
+  }
+  .react-flow__edge:hover .react-flow__edge-path {
+    stroke: #ff9800;
+    stroke-width: 3.5;
+    filter: drop-shadow(0 0 6px #ff9800);
+  }
+  .react-flow__edge.selected .react-flow__edge-path {
+    stroke: #b1b1b7;
+    stroke-width: 1.5;
+  }
+  .react-flow__edge.selected:hover .react-flow__edge-path {
+    stroke: #ff9800;
+    stroke-width: 3.5;
+  }
+`;
+
 /**
  * Nodo estático: solo renderiza los Handles que tienen alguna arista conectada.
- * Como el grafo no cambia, no necesita useUpdateNodeInternals ni efectos.
  */
 const CardinalNode = memo(function CardinalNode({ data }) {
   const active = data.activeHandles;
@@ -127,12 +171,16 @@ const createActiveHandles = () => ({
 });
 
 /**
- * Construye el grafo completo UNA sola vez (a nivel de módulo).
- * Nodos y aristas ya salen con sus handles activos calculados.
+ * Construye el grafo completo UNA sola vez (a nivel de módulo):
+ *  - nodes / edges con sus handles activos
+ *  - relations: para cada nodo, sus vecinos DIRECTOS (previos y siguientes),
+ *    es decir, los conectados por una arista sin nodos intermedios.
  */
 function buildGraphFromJson(data) {
   let autoPositionedCount = 0;
   const nodeMap = new Map();
+  const prevSets = new Map();
+  const nextSets = new Map();
 
   const nodes = data.map((item) => {
     const hasValidPosition =
@@ -155,6 +203,8 @@ function buildGraphFromJson(data) {
     };
 
     nodeMap.set(node.id, node);
+    prevSets.set(node.id, new Set());
+    nextSets.set(node.id, new Set());
     return node;
   });
 
@@ -180,40 +230,120 @@ function buildGraphFromJson(data) {
       sourceNode.data.activeHandles[sourceHandle].source = true;
       targetNode.data.activeHandles[targetHandle].target = true;
 
+      if (sourceId !== targetId) {
+        nextSets.get(sourceId).add(targetId);
+        prevSets.get(targetId).add(sourceId);
+      }
+
       edges.push({
         id: `e-${sourceId}-${targetId}-${idx}`,
         source: sourceId,
         target: targetId,
         sourceHandle,
         targetHandle,
+        selectable: true, // necesario para que la arista reciba el hover
+        interactionWidth: 24, // zona de hover más ancha que la línea visible
       });
     });
   });
 
-  return { nodes, edges };
+  const toLabels = (set) =>
+    Array.from(set, (id) => nodeMap.get(id).data.label.replace(/\n/g, ' '));
+
+  const relations = new Map();
+  nodes.forEach((node) => {
+    relations.set(node.id, {
+      label: node.data.label,
+      prev: toLabels(prevSets.get(node.id)),
+      next: toLabels(nextSets.get(node.id)),
+    });
+  });
+
+  return { nodes, edges, relations };
 }
 
-// Se calcula una única vez al cargar el módulo; el componente nunca vuelve a recalcular
-const { nodes, edges } = buildGraphFromJson(rawData);
+// Se calcula una única vez al cargar el módulo
+const { nodes, edges, relations } = buildGraphFromJson(rawData);
+
+function RelationList({ title, items }) {
+  return (
+    <>
+      <div style={sectionTitleStyle}>{title}</div>
+      {items.length === 0 ? (
+        <div style={emptyStyle}>Ninguno</div>
+      ) : (
+        <ul style={listStyle}>
+          {items.map((label, i) => (
+            <li key={i}>{label}</li>
+          ))}
+        </ul>
+      )}
+    </>
+  );
+}
+
+const NodePopover = memo(function NodePopover({ selected }) {
+  const info = relations.get(selected.id);
+  if (!info) return null;
+
+  // Evita que el desplegable se salga de la pantalla
+  const left = Math.max(8, Math.min(selected.x, window.innerWidth - POPOVER_WIDTH - 8));
+  const top = Math.max(8, Math.min(selected.y, window.innerHeight - 120));
+
+  return (
+    <div style={{ ...popoverStyle, left, top }}>
+      <div style={popoverTitleStyle}>{info.label}</div>
+      <RelationList title="Vienen de (previos)" items={info.prev} />
+      <RelationList title="Van hacia (siguientes)" items={info.next} />
+    </div>
+  );
+});
+
+/**
+ * El grafo va en un componente memoizado con callbacks estables:
+ * abrir/cerrar el desplegable NO vuelve a renderizar nodos ni aristas.
+ */
+const Graph = memo(function Graph({ onNodeClick, onClose }) {
+  return (
+    <ReactFlow
+      nodes={nodes}
+      edges={edges}
+      nodeTypes={nodeTypes}
+      nodesDraggable={false}
+      nodesConnectable={false}
+      elementsSelectable={false}
+      edgesFocusable={false}
+      nodesFocusable={false}
+      onlyRenderVisibleElements
+      onNodeClick={onNodeClick}
+      onPaneClick={onClose}
+      onMoveStart={onClose}
+      fitView
+    >
+      <Background />
+      <Controls showInteractive={false} />
+    </ReactFlow>
+  );
+});
 
 function FlowApp() {
+  const [selected, setSelected] = useState(null);
+
+  const onNodeClick = useCallback((event, node) => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const next = { id: node.id, x: rect.right + 10, y: rect.top };
+    // Click sobre el mismo nodo = cerrar
+    setSelected((prev) => (prev && prev.id === node.id ? null : next));
+  }, []);
+
+  // Cierra al hacer click en el fondo o al mover/hacer zoom (el desplegable es fijo en pantalla)
+  const onClose = useCallback(() => setSelected(null), []);
+
   return (
     <div style={containerStyle}>
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        nodesDraggable={false}
-        nodesConnectable={false}
-        elementsSelectable={false}
-        edgesFocusable={false}
-        nodesFocusable={false}
-        onlyRenderVisibleElements
-        fitView
-      >
-        <Background />
-        <Controls showInteractive={false} />
-      </ReactFlow>
+      <style>{flowCss}</style>
+      <Graph onNodeClick={onNodeClick} onClose={onClose} />
+      {selected && <NodePopover selected={selected} />}
     </div>
   );
 }
